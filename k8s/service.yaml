@@ -1,0 +1,14 @@
+# Exposes the streamable-http MCP endpoint for the Renfield backend to reach as
+# http://renfield-mcp-email-ingest:8080/mcp (if/when registered as an MCP stanza).
+# The primary job — the IMAP-IDLE auto-push watcher — needs no inbound service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: renfield-mcp-email-ingest
+  namespace: renfield
+spec:
+  selector:
+    app: renfield-mcp-email-ingest
+  ports:
+    - port: 8080
+      targetPort: 8080

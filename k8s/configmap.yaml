@@ -1,0 +1,20 @@
+# The watched mailboxes — edit + re-apply to add/remove a mailbox at runtime (the
+# daemon reloads on change; no pod restart). Credentials are referenced by env-var
+# name (see secret.example.yaml), never inlined here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: renfield-mcp-email-ingest-mailboxes
+  namespace: renfield
+data:
+  mailboxes.yaml: |
+    mailboxes:
+      - id: buchhaltung
+        host: imap.example.com
+        port: 993
+        ssl: true
+        username_env: BUCHHALTUNG_IMAP_USER
+        password_env: BUCHHALTUNG_IMAP_PASS
+        inbox: INBOX
+        processed_folder: Verarbeitet
+        failed_folder: Fehler

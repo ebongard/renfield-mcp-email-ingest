@@ -1,0 +1,45 @@
+# Single replica: this is a watcher daemon — two replicas would both IDLE the
+# same mailboxes and double-push. Recreate strategy so a rollout never runs two.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: renfield-mcp-email-ingest
+  namespace: renfield
+  labels:
+    app: renfield-mcp-email-ingest
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: renfield-mcp-email-ingest
+  template:
+    metadata:
+      labels:
+        app: renfield-mcp-email-ingest
+    spec:
+      containers:
+        - name: renfield-mcp-email-ingest
+          image: registry.treehouse.x-idra.de/renfield/email-ingest-mcp:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: RENFIELD_URL
+              value: "http://backend:8000"
+            - name: EMAIL_MAILBOXES_YAML
+              value: "/config/mailboxes.yaml"
+            # Optional: POST failure/disconnect notifications somewhere.
+            # - name: EMAIL_NOTIFY_WEBHOOK_URL
+            #   value: "http://backend:8000/api/notifications/webhook"
+          envFrom:
+            - secretRef:
+                name: renfield-mcp-email-ingest-secrets
+          volumeMounts:
+            - name: mailboxes
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: mailboxes
+          configMap:
+            name: renfield-mcp-email-ingest-mailboxes

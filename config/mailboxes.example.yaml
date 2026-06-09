@@ -1,0 +1,22 @@
+# Watched mailboxes for renfield-mcp-email-ingest.
+#
+# Mount this as a ConfigMap at the path given by EMAIL_MAILBOXES_YAML. It is
+# reloaded at RUNTIME when it changes — add/remove a mailbox by editing it, no
+# redeploy. IMAP credentials are referenced by ENV-VAR NAME (kept in a Secret),
+# NEVER inlined here, so this file can live in a ConfigMap safely.
+#
+# SECURITY: a mailbox config holds ONLY the IMAP connection + a routing `id`.
+# It does NOT hold owner/tier/knowledge-base — those are SERVER-AUTHORITATIVE
+# (the backend resolves `id` -> owner/tier/kb via its email_ingest_mailboxes
+# routing table). So a leaked push token can never escalate a mailbox's tier.
+
+mailboxes:
+  - id: buchhaltung              # the mailbox_id sent to the backend (routing key)
+    host: imap.example.com
+    port: 993
+    ssl: true
+    username_env: BUCHHALTUNG_IMAP_USER  # resolved from the env (a Secret)
+    password_env: BUCHHALTUNG_IMAP_PASS
+    inbox: INBOX                 # folder to watch via IMAP IDLE
+    processed_folder: Verarbeitet  # messages move here once an attachment ingests
+    failed_folder: Fehler          # messages move here on a terminal failure

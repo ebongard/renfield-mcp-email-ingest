@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renfield-mcp-email-ingest"
+version = "0.1.0"
+description = "Email-ingest MCP server: event-driven IMAP-IDLE detection of new mail, attachments pushed into Renfield over REST."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.26.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "watchdog>=4.0",        # event-driven mailboxes.yaml reload (inotify on Linux)
+    "aioimaplib>=1.0.1",    # async IMAP with IDLE (event-driven mail detection)
+]
+
+[project.scripts]
+renfield-mcp-email-ingest = "renfield_mcp_email_ingest.server:main"
+renfield-mcp-email-ingest-scan = "renfield_mcp_email_ingest.scan:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.setuptools.packages.find]
+include = ["renfield_mcp_email_ingest*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
