@@ -17,7 +17,7 @@ def build_message(
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = sender
-    msg["To"] = "buchhaltung@x-idra.de"
+    msg["To"] = "inbox@example.com"
     if message_id is not None:
         msg["Message-ID"] = message_id
     msg.set_content(body)
