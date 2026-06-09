@@ -3,12 +3,14 @@
 Pure stdlib (``email``), so it is fully unit-testable without an IMAP server —
 the IMAP I/O is isolated in the provider; everything content-related lives here.
 
-**Attachments only, skip inline (decision #2).** A leaf part is an attachment if
-it has a filename and is not explicitly ``Content-Disposition: inline`` — this
-captures both ``disposition=attachment`` parts and parts that carry only a
-``Content-Type`` name, while excluding inline images (signatures, logos, embedded
-HTML images) which are noise, not documents. ``multipart/*`` containers and the
-text/html bodies are never attachments.
+**Attachments only, skip inline IMAGES (decision #2).** A leaf part with a
+filename is an attachment UNLESS it is an inline image — i.e. we skip a part only
+when ``Content-Disposition: inline`` AND its main type is ``image`` (signatures,
+logos, embedded HTML images = noise). We deliberately KEEP inline *documents*: a
+real PDF/invoice is often sent ``Content-Disposition: inline; filename="x.pdf"``
+(Apple Mail, many forwarders), and dropping those would silently lose the very
+documents we exist to ingest. ``multipart/*`` containers and the text/html bodies
+have no filename and are never attachments.
 """
 
 from __future__ import annotations
@@ -69,8 +71,12 @@ def parse_message(raw: bytes) -> ParsedMessage:
         filename = part.get_filename()
         if not filename:
             continue
-        # Skip inline parts (logos / signature images / embedded HTML images).
-        if (part.get_content_disposition() or "").lower() == "inline":
+        # Skip ONLY inline images (logos / signatures / embedded HTML images).
+        # Keep inline documents (inline PDFs are common + are real attachments).
+        if (
+            (part.get_content_disposition() or "").lower() == "inline"
+            and part.get_content_maintype() == "image"
+        ):
             continue
         try:
             payload = part.get_payload(decode=True)

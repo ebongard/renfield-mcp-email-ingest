@@ -35,7 +35,7 @@ def test_plain_body_is_not_an_attachment():
     assert parsed.attachments == ()
 
 
-def test_inline_parts_are_skipped():
+def test_inline_images_are_skipped():
     # A real PDF attachment + an inline logo. Only the PDF should surface.
     raw = build_message(
         attachments=[("rechnung.pdf", b"%PDF", "application", "pdf")],
@@ -43,6 +43,17 @@ def test_inline_parts_are_skipped():
     )
     parsed = parse_message(raw)
     assert [a.filename for a in parsed.attachments] == ["rechnung.pdf"]
+
+
+def test_inline_pdf_is_kept():
+    # An inline-disposition PDF (Apple Mail / forwards) is a REAL document and
+    # must be ingested, not dropped as if it were an inline image.
+    raw = build_message(
+        body="see attached",
+        inline=[("vertrag.pdf", b"%PDF inline", "application", "pdf")],
+    )
+    parsed = parse_message(raw)
+    assert [a.filename for a in parsed.attachments] == ["vertrag.pdf"]
 
 
 def test_missing_message_id_is_fabricated_and_stable():

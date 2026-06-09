@@ -63,9 +63,11 @@ def aggregate(outcomes: list[PushOutcome], *, had_attachments: bool, all_rejecte
         return MessageDisposition.FAILED  # real docs all terminally rejected
     if all_rejected:
         return MessageDisposition.FAILED  # had attachments, none ingestable
-    if not had_attachments:
-        return MessageDisposition.SKIP  # plain email, no files — not our concern
-    return MessageDisposition.SKIP  # defensive default
+    # Nothing was pushed and nothing was gate-rejected → a plain email with no
+    # files. Not our concern: mark it seen + leave it (``had_attachments`` is
+    # False here by construction, since any accepted attachment yields a pushed
+    # outcome and any rejected one sets ``all_rejected``).
+    return MessageDisposition.SKIP
 
 
 class MessageEngine:
@@ -90,6 +92,14 @@ class MessageEngine:
         self._max_retries = max_retries
         self._retry_base = retry_base_seconds
         self._inflight: set[str] = set()
+        # UIDs that exhausted their retry budget this session. They stay UNSEEN
+        # in the inbox (a transient outage shouldn't mis-file them to failed/),
+        # but IMAP IDLE re-emits every UNSEEN uid on each wake — without this
+        # guard a permanently-failing message would restart its whole retry
+        # ladder (and re-notify) on every wake. Parking matches folder-ingest's
+        # "retry on the next restart's reconciliation" semantics (a fresh process
+        # starts with an empty set), without the per-wake re-loop / notify spam.
+        self._exhausted: set[str] = set()
         self._retry_tasks: set[asyncio.Task] = set()
         self._stopped = asyncio.Event()
 
@@ -126,9 +136,10 @@ class MessageEngine:
         uid = (uid or "").strip()
         if not uid:
             return
-        # De-dup: ignore a message already being processed or awaiting retry (IDLE
-        # re-emits every UNSEEN uid on each wake; the inflight set makes that O(1)).
-        if uid in self._inflight:
+        # De-dup: ignore a message already being processed, awaiting retry, or
+        # parked after exhausting its retries (IDLE re-emits every UNSEEN uid on
+        # each wake; these sets make that O(1) and prevent a re-loop).
+        if uid in self._inflight or uid in self._exhausted:
             return
         self._inflight.add(uid)
         await self._process(uid, attempt=0)
@@ -210,9 +221,14 @@ class MessageEngine:
                 await self._on_failed(self._name, uid, reason)
         elif disp is MessageDisposition.SKIP:
             # Plain email, no ingestable attachments: flag \Seen so reconciliation
-            # skips it, but never move the user's mail.
+            # skips it, but never move the user's mail. Best-effort — a STORE
+            # failure must not cascade into a retry of a doc-less email (it would
+            # just re-SKIP); park it so it isn't re-dispatched every IDLE wake.
             try:
                 await self._provider.mark_seen(uid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("mailbox %s: mark_seen %s failed: %s", self._name, uid, exc)
+                self._exhausted.add(uid)
             finally:
                 self._inflight.discard(uid)
         else:  # LEAVE → bounded retry (leave UNSEEN for re-push)
@@ -227,9 +243,12 @@ class MessageEngine:
 
     async def _schedule_retry(self, uid: str, attempt: int, reason: str) -> None:
         if attempt + 1 >= self._max_retries:
-            # Give up: leave the message UNSEEN in the inbox + release it (a future
-            # IDLE event or the next restart's reconciliation re-tries). Notify.
+            # Give up: leave the message UNSEEN in the inbox but PARK it for this
+            # session (release inflight + add to _exhausted) so IDLE-wake re-emits
+            # don't restart the ladder. The next pod restart re-tries it (fresh
+            # _exhausted). Notify ONCE.
             self._inflight.discard(uid)
+            self._exhausted.add(uid)
             logger.warning(
                 "mailbox %s: msg %s exhausted %d retries (%s); leaving in inbox",
                 self._name, uid, self._max_retries, reason,

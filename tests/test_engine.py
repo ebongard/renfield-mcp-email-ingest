@@ -167,6 +167,45 @@ async def test_retry_then_exhausts_and_notifies():
     assert failures and "retry_exhausted" in failures[0]
 
 
+async def test_retry_exhausted_uid_is_parked_not_relooped():
+    # After exhausting retries, a re-emit of the SAME uid (what IDLE does on every
+    # wake) must be ignored — no fresh retry ladder, no repeat notification.
+    raw = build_message(attachments=[PDF])
+    prov = FakeProvider({"1": raw})
+    push = FakePusher(PushOutcome(move=AttachmentMove.LEAVE))  # always transient
+    failures = []
+
+    async def on_failed(mbox, ref, reason):
+        failures.append(reason)
+
+    eng = _engine(prov, push, on_failed=on_failed, max_retries=3, retry_base=0.001)
+    await eng._dispatch("1")
+    await asyncio.sleep(0.05)
+    calls_after_exhaust = len(push.calls)
+    await eng._dispatch("1")  # IDLE re-emits the still-UNSEEN uid
+    await asyncio.sleep(0.02)
+    assert len(push.calls) == calls_after_exhaust  # parked — no new attempts
+    assert len(failures) == 1  # notified exactly once
+
+
+async def test_mark_seen_failure_parks_message():
+    # A plain email (SKIP). If mark_seen fails, the message must be parked, not
+    # re-dispatched forever, and the failure must not cascade into a retry push.
+    class _SeenFails(FakeProvider):
+        async def mark_seen(self, uid):
+            raise RuntimeError("STORE failed")
+
+    raw = build_message(attachments=[])
+    prov = _SeenFails({"1": raw})
+    push = FakePusher(_ok())
+    eng = _engine(prov, push)
+    await eng._dispatch("1")
+    await asyncio.sleep(0.02)
+    assert push.calls == [] and prov.moved == []
+    await eng._dispatch("1")  # re-emit — parked, ignored
+    assert push.calls == []
+
+
 async def test_fatal_stops_mailbox_and_notifies():
     raw = build_message(attachments=[PDF])
     prov = FakeProvider({"1": raw})

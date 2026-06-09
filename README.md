@@ -122,3 +122,17 @@ EMAIL_LIVE_IMAP_HOST=... EMAIL_LIVE_IMAP_USER=... EMAIL_LIVE_IMAP_PASS=... \
 The content/aggregation/transport logic is fully unit-tested with a fake
 provider + a mock HTTP transport; the live IMAP IDLE/fetch/move loop is validated
 by the opt-in live test (mirrors the filesystem repo's live inotify test).
+
+## Known limitations (validate during live bring-up)
+
+- **UIDVALIDITY.** Messages are keyed by IMAP UID. If a server bumps the inbox's
+  `UIDVALIDITY` (mailbox recreated / index rebuilt), in-flight UIDs would address
+  different messages. Rare; the UID-based design is the standard one and a fresh
+  reconnect re-SEARCHes, but a validity-change flush is not yet implemented —
+  confirm behavior against the target server during bring-up.
+- **Servers without RFC 6851 MOVE *and* without UIDPLUS UID EXPUNGE.** The
+  watcher COPYs to the target folder and flags the original `\Deleted \Seen`, but
+  deliberately does NOT issue a bare `EXPUNGE` (that would purge *all* `\Deleted`
+  mail in the inbox). On such a server the originals accumulate `\Deleted` in the
+  inbox until the user's own client expunges. Modern servers (Dovecot, Gmail,
+  Outlook, Cyrus) support MOVE, so this is the cold path.

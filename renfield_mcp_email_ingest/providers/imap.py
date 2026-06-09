@@ -93,6 +93,7 @@ class ImapProvider(MailboxProvider):
         self._connected = False
         self._last_error: str | None = None
         self._known_folders: set[str] = set()
+        self._reconnect_attempt = 0
 
     @property
     def last_error(self) -> str | None:
@@ -120,13 +121,20 @@ class ImapProvider(MailboxProvider):
         await client.select(m.inbox)
         return client
 
+    async def _ensure_cmd(self):
+        """Return the command connection, lazily (re)establishing it if absent.
+        Callers MUST already hold ``self._cmd_lock``."""
+        if self._cmd is None:
+            self._cmd = await self._new_client()
+        return self._cmd
+
     async def connect(self) -> None:
         """Establish the command connection + ensure the move folders exist.
         Does NOT start IDLE (used by dry-run + as the first half of start())."""
-        if self._cmd is None:
-            self._cmd = await self._new_client()
-        for folder in (self._mailbox.processed_folder, self._mailbox.failed_folder):
-            await self._ensure_folder(folder)
+        async with self._cmd_lock:
+            await self._ensure_cmd()
+            for folder in (self._mailbox.processed_folder, self._mailbox.failed_folder):
+                await self._ensure_folder(folder)
 
     async def start(self) -> None:
         await self.connect()
@@ -155,7 +163,10 @@ class ImapProvider(MailboxProvider):
     # -- IDLE loop (event-driven) with reconnect/backoff --
 
     async def _watch_with_reconnect(self) -> None:
-        attempt = 0
+        # ``_idle_loop`` never returns normally (it loops until an exception), so
+        # the backoff counter is reset by the loop itself once a cycle completes
+        # healthily — see ``self._reconnect_attempt``.
+        self._reconnect_attempt = 0
         while True:
             try:
                 await self._idle_loop()  # runs until an error/disconnect
@@ -171,11 +182,9 @@ class ImapProvider(MailboxProvider):
                     except Exception:  # noqa: BLE001
                         pass
                 await self._reset_idle_client()
-                delay = reconnect_delay(attempt)
-                attempt += 1
+                delay = reconnect_delay(self._reconnect_attempt)
+                self._reconnect_attempt += 1
                 await asyncio.sleep(delay)
-                continue
-            attempt = 0
 
     async def _reset_idle_client(self) -> None:
         if self._idle is not None:
@@ -188,27 +197,43 @@ class ImapProvider(MailboxProvider):
     async def _idle_loop(self) -> None:
         """Enter IDLE, wait for a server push (or the renew timeout), then SEARCH
         UNSEEN on the command connection and enqueue new UIDs. Event-driven: the
-        IDLE waits server-side until the server reports a change."""
+        IDLE waits server-side until the server reports a change.
+
+        A renew timeout (no push within ``idle_renew``) is NORMAL, not a
+        disconnect: we always end the IDLE cleanly and loop to re-enter it. Only a
+        real connection error escapes (to the reconnect/backoff handler)."""
         if self._idle is None:
             self._idle = await self._new_client()
         self._connected = True
         self._last_error = None
         while True:
             idle = await self._idle.idle_start(timeout=self._idle_renew)
-            await self._idle.wait_server_push()
-            if self._idle.has_pending_idle():
-                self._idle.idle_done()
-            await asyncio.wait_for(idle, timeout=15)
-            # A wake means "something changed" — re-scan UNSEEN (this SEARCH is
-            # triggered by the server's push, not a timer; not a poll).
+            try:
+                # Returns on a server push, or raises TimeoutError on the renew
+                # window — both mean "end this IDLE and re-scan / re-arm".
+                await self._idle.wait_server_push()
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                if self._idle.has_pending_idle():
+                    self._idle.idle_done()
+                # Drain the IDLE command future; never let cleanup wedge the loop.
+                try:
+                    await asyncio.wait_for(idle, timeout=15)
+                except asyncio.TimeoutError:
+                    pass
+            # A wake means "something may have changed" — re-scan UNSEEN (this
+            # SEARCH is triggered by the server's push / renew, not a poll timer).
             for uid in await self._search_unseen():
                 self._queue.put_nowait(NewMessage(uid))
+            # A full healthy cycle → reset the reconnect backoff so a later blip
+            # recovers fast instead of waiting the capped delay.
+            self._reconnect_attempt = 0
 
     async def _search_unseen(self) -> list[str]:
         async with self._cmd_lock:
-            if self._cmd is None:
-                self._cmd = await self._new_client()
-            resp = await self._cmd.uid_search("UNSEEN")
+            cmd = await self._ensure_cmd()
+            resp = await cmd.uid_search("UNSEEN")
         if resp.result != "OK":
             logger.warning("mailbox %s: UID SEARCH UNSEEN -> %s", self.mailbox_id, resp.result)
             return []
@@ -220,47 +245,70 @@ class ImapProvider(MailboxProvider):
         return await self._search_unseen()
 
     async def fetch_raw(self, uid: str) -> bytes | None:
+        """Fetch the raw RFC-822 bytes. A non-OK FETCH is a TRANSIENT error
+        (a half-dead connection, a server hiccup) → raise so the engine retries;
+        a vanished UID returns OK with no literal in IMAP, which we map to None
+        (already moved/expunged). Never silently drop a message on a transient."""
         async with self._cmd_lock:
-            if self._cmd is None:
-                self._cmd = await self._new_client()
-            resp = await self._cmd.uid("fetch", uid, "(RFC822)")
+            cmd = await self._ensure_cmd()
+            resp = await cmd.uid("fetch", uid, "(RFC822)")
         if resp.result != "OK":
-            return None
+            raise RuntimeError(f"IMAP FETCH {uid} -> {resp.result} {resp.lines!r}")
         return extract_rfc822(resp.lines)
 
     async def move_message(self, uid: str, folder: str) -> None:
         async with self._cmd_lock:
-            if self._cmd is None:
-                self._cmd = await self._new_client()
+            cmd = await self._ensure_cmd()
             await self._ensure_folder(folder)
-            # Prefer server-side MOVE (RFC 6851); fall back to COPY + \Deleted +
-            # EXPUNGE so it works on servers without the MOVE capability.
-            resp = await self._cmd.uid("move", uid, _quote(folder))
+            # Prefer server-side MOVE (RFC 6851) — atomic, no half-state.
+            resp = await cmd.uid("move", uid, _quote(folder))
             if resp.result == "OK":
                 return
+            # Fallback for servers without MOVE: COPY + flag \Deleted + expunge
+            # ONLY THIS UID via UID EXPUNGE (UIDPLUS, RFC 4315). We must NEVER fall
+            # back to a bare EXPUNGE — that purges EVERY \Deleted message in the
+            # mailbox, which on a shared inbox would silently destroy unrelated
+            # mail the user soft-deleted elsewhere. If neither MOVE nor UID EXPUNGE
+            # is available, we leave the COPY + \Deleted flag in place (the doc is
+            # already filed) and let the user's client expunge — loudly logged.
             logger.info(
-                "mailbox %s: UID MOVE unsupported (%s); COPY+EXPUNGE fallback",
+                "mailbox %s: UID MOVE unsupported (%s); COPY + UID EXPUNGE fallback",
                 self.mailbox_id, resp.result,
             )
-            copy = await self._cmd.uid("copy", uid, _quote(folder))
+            copy = await cmd.uid("copy", uid, _quote(folder))
             if copy.result != "OK":
                 raise RuntimeError(f"IMAP COPY failed: {copy.result} {copy.lines!r}")
-            await self._cmd.uid("store", uid, "+FLAGS", "(\\Deleted)")
+            # Flag \Seen too: if the UID EXPUNGE below can't run (no UIDPLUS), the
+            # original stays in the inbox — \Seen keeps it out of the UNSEEN watch
+            # set so it isn't re-dispatched + re-COPY'd on every IDLE wake.
+            await cmd.uid("store", uid, "+FLAGS", "(\\Deleted \\Seen)")
             try:
-                await self._cmd.uid("expunge", uid)  # UIDPLUS — only this uid
-            except Exception:  # noqa: BLE001 - server lacks UIDPLUS
-                await self._cmd.expunge()
+                expunge = await cmd.uid("expunge", uid)  # UIDPLUS — only this uid
+                ok = getattr(expunge, "result", "OK") == "OK"
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                logger.warning("mailbox %s: UID EXPUNGE %s raised: %s", self.mailbox_id, uid, exc)
+            if not ok:
+                logger.warning(
+                    "mailbox %s: server lacks UID EXPUNGE — message %s left flagged "
+                    "\\Deleted (NOT bare-EXPUNGE'd, to avoid purging other mail)",
+                    self.mailbox_id, uid,
+                )
 
     async def mark_seen(self, uid: str) -> None:
         async with self._cmd_lock:
-            if self._cmd is None:
-                self._cmd = await self._new_client()
-            await self._cmd.uid("store", uid, "+FLAGS", "(\\Seen)")
+            cmd = await self._ensure_cmd()
+            await cmd.uid("store", uid, "+FLAGS", "(\\Seen)")
 
     async def _ensure_folder(self, folder: str) -> None:
-        if folder in self._known_folders or self._cmd is None:
-            self._known_folders.add(folder)
+        """Create the move folder if we haven't already this session. Callers hold
+        ``self._cmd_lock`` and have ensured ``self._cmd``. If the connection is
+        somehow absent we do NOT mark the folder known — so a later call still
+        creates it (rather than permanently assuming it exists)."""
+        if folder in self._known_folders:
             return
+        if self._cmd is None:
+            return  # cannot create now; retry on the next call (not marked known)
         # CREATE is idempotent enough — a NO on an existing folder is fine.
         try:
             await self._cmd.create(_quote(folder))
