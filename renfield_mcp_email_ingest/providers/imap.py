@@ -181,7 +181,14 @@ class ImapProvider(MailboxProvider):
                         await self._disconnect_hook(self.mailbox_id, str(exc))
                     except Exception:  # noqa: BLE001
                         pass
+                # Reset BOTH connections. A disconnect (e.g. a server BYE timeout
+                # ending the IDLE) can leave the command connection dead too;
+                # resetting only the IDLE one left the next SEARCH UNSEEN running
+                # on a dead command connection — which threw every cycle, so the
+                # watch loop re-armed IDLE but never recovered and stopped
+                # detecting mail entirely until a pod restart.
                 await self._reset_idle_client()
+                await self._reset_cmd_client()
                 delay = reconnect_delay(self._reconnect_attempt)
                 self._reconnect_attempt += 1
                 await asyncio.sleep(delay)
@@ -193,6 +200,17 @@ class ImapProvider(MailboxProvider):
             except Exception:  # noqa: BLE001
                 pass
             self._idle = None
+
+    async def _reset_cmd_client(self) -> None:
+        """Drop the command connection so the next ``_ensure_cmd`` rebuilds it
+        fresh. Held under ``_cmd_lock`` to not race an in-flight SEARCH/FETCH/MOVE."""
+        async with self._cmd_lock:
+            if self._cmd is not None:
+                try:
+                    await self._cmd.logout()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._cmd = None
 
     async def _idle_loop(self) -> None:
         """Enter IDLE, wait for a server push (or the renew timeout), then SEARCH
