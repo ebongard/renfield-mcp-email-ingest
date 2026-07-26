@@ -132,6 +132,23 @@ class MessageEngine:
         for uid in uids:
             await self._dispatch(uid)
 
+    async def recover(self) -> None:
+        """Backend-recovery re-reconcile (down→up): un-park messages that exhausted
+        their retries during a backend outage and re-scan UNSEEN, so parked mail is
+        pushed WITHOUT a manual restart (mirrors the filesystem MCP's recovery
+        reconcile). Clearing ``_exhausted`` is what un-sticks them — ``_dispatch``
+        skips exhausted uids, and the outage's parked uids are still UNSEEN (never
+        moved to the processed folder), so ``_reconcile_unseen`` re-lists them."""
+        if self._stopped.is_set():
+            return
+        if self._exhausted:
+            logger.info(
+                "mailbox %s: backend recovered — un-parking %d exhausted message(s)",
+                self._name, len(self._exhausted),
+            )
+            self._exhausted.clear()
+        await self._reconcile_unseen()
+
     async def _dispatch(self, uid: str) -> None:
         uid = (uid or "").strip()
         if not uid:

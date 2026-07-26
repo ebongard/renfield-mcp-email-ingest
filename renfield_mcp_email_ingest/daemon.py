@@ -54,6 +54,10 @@ class MailboxDaemonManager:
         self._yaml_observer: Observer | None = None
         self._reload_handle: asyncio.TimerHandle | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Backend-recovery detector. Assume healthy at boot (startup reconcile just
+        # ran), so only a genuine down→up transition re-reconciles.
+        self._healthy = True
+        self._health_task: asyncio.Task | None = None
         for mailbox in config.mailboxes:
             self._build(mailbox)
 
@@ -65,9 +69,15 @@ class MailboxDaemonManager:
             self._launch(name)
         if self._config.mailboxes_path:
             self._watch_yaml(self._config.mailboxes_path)
+        if self._config.health_poll_seconds > 0:
+            self._health_task = asyncio.create_task(self._health_poll_loop())
         logger.info("daemon started with mailboxes: %s", self.names())
 
     async def stop(self) -> None:
+        if self._health_task is not None:
+            self._health_task.cancel()
+            await asyncio.gather(self._health_task, return_exceptions=True)
+            self._health_task = None
         if self._yaml_observer is not None:
             self._yaml_observer.stop()
             await asyncio.to_thread(self._yaml_observer.join, 5)
@@ -88,6 +98,40 @@ class MailboxDaemonManager:
             return
         await self._apply(new)
         logger.info("mailboxes reloaded: %s", self.names())
+
+    # -- backend-recovery detector (re-reconcile on down→up) --
+
+    async def _health_poll_loop(self) -> None:
+        """Poll the backend health endpoint; on a down→up transition re-reconcile
+        every mailbox (un-park exhausted mail + re-scan UNSEEN). This un-sticks mail
+        left parked after retry-exhaustion during a backend outage WITHOUT a manual
+        restart — the specific gap this closes (the filesystem MCP already does it).
+        A backend-liveness probe (like a readiness check), NOT an IMAP poll:
+        detection stays IDLE-driven; this only reacts to the backend coming back."""
+        interval = self._config.health_poll_seconds
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                healthy = await self._pusher.health()
+                if healthy and not self._healthy:
+                    logger.info(
+                        "backend recovered (health OK) — re-reconciling %d mailbox(es)",
+                        len(self._engines),
+                    )
+                    for engine in list(self._engines.values()):
+                        try:
+                            await engine.recover()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("recovery reconcile failed: %s", exc)
+                elif not healthy and self._healthy:
+                    logger.warning(
+                        "backend health check failing — will re-reconcile on recovery"
+                    )
+                self._healthy = healthy
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001 - never let the loop die
+                logger.warning("health poll loop error: %s", exc)
 
     # -- build / launch / stop --
 

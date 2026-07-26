@@ -24,6 +24,7 @@ import httpx
 from .contract import (
     CONTRACT_HEADER,
     EMAIL_INGEST_CONTRACT_VERSION,
+    HEALTH_PATH,
     INGEST_PATH,
     AttachmentMove,
     attachment_move_for,
@@ -44,12 +45,29 @@ class PushOutcome:
 
 class RenfieldPusher:
     def __init__(self, renfield_url: str, ingest_token: str, timeout_seconds: float = 120.0):
-        self._url = renfield_url.rstrip("/") + INGEST_PATH
+        base = renfield_url.rstrip("/")
+        self._url = base + INGEST_PATH
+        self._health_url = base + HEALTH_PATH
         self._headers = {
             "Authorization": f"Bearer {ingest_token}",
             CONTRACT_HEADER: EMAIL_INGEST_CONTRACT_VERSION,
         }
         self._timeout = timeout_seconds
+
+    async def health(self) -> bool:
+        """Liveness probe against the email-ingest health endpoint. True only on a
+        200 (backend up AND the token accepted). Used by the daemon's recovery
+        detector: a down→up transition re-reconciles each mailbox so mail that
+        exhausted its retries during a backend outage gets pushed WITHOUT a manual
+        restart (the filesystem MCP already does this; this closes the asymmetry).
+        A wrong token (401/403) reads as unhealthy — it needs operator action, not
+        an auto re-reconcile. Never raises."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(self._health_url, headers=self._headers)
+            return resp.status_code == 200
+        except httpx.HTTPError:
+            return False
 
     async def push(
         self,
