@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "renfield-mcp-email-ingest"
-version = "0.1.1"
+version = "0.1.2"
 description = "Email-ingest MCP server: event-driven IMAP-IDLE detection of new mail, attachments pushed into Renfield over REST."
 readme = "README.md"
 license = {text = "MIT"}
