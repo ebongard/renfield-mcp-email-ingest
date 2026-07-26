@@ -96,6 +96,10 @@ class Config(BaseModel):
     max_file_size_mb: int = 50
     push_timeout_seconds: float = 120.0
     idle_renew_seconds: int = DEFAULT_IDLE_RENEW_SECONDS
+    # Backend health poll (recovery detector, NOT an IMAP poll). On a down→up
+    # transition the daemon re-reconciles every mailbox so mail parked after
+    # retry-exhaustion during a backend outage is pushed without a restart. 0 = off.
+    health_poll_seconds: float = 30.0
     mailboxes_path: str | None = None  # the mounted mailboxes.yaml (for reload)
     mailboxes: list[Mailbox] = Field(default_factory=list)
 
@@ -147,6 +151,7 @@ def load_config() -> Config:
         idle_renew_seconds=int(
             os.environ.get("EMAIL_IDLE_RENEW_SECONDS", str(DEFAULT_IDLE_RENEW_SECONDS))
         ),
+        health_poll_seconds=float(os.environ.get("EMAIL_HEALTH_POLL_SECONDS", "30")),
         mailboxes_path=mailboxes_path,
         mailboxes=mailboxes,
     )

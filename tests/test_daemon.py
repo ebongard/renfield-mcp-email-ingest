@@ -106,3 +106,61 @@ async def test_stop_stops_all_providers():
     await mgr.stop()
     assert all(p.stopped for p in _IdleProvider.instances)
     assert mgr.names() == []
+
+# -- backend-recovery detector (re-reconcile on down→up) --
+
+@pytest.mark.asyncio
+async def test_health_recovery_triggers_recover():
+    """A backend down→up transition re-reconciles every mailbox (un-parks mail
+    left exhausted during the outage) WITHOUT a restart."""
+    import asyncio
+    mgr = _manager([_mbox("m1")])
+    object.__setattr__(mgr._config, "health_poll_seconds", 0.01)
+
+    recovered = {"count": 0}
+
+    async def fake_recover():
+        recovered["count"] += 1
+
+    for eng in mgr._engines.values():
+        eng.recover = fake_recover
+
+    seq = iter([False, True, True])
+
+    async def fake_health():
+        try:
+            return next(seq)
+        except StopIteration:
+            return True
+
+    mgr._pusher.health = fake_health
+    await mgr.start()
+    await asyncio.sleep(0.05)
+    await mgr.stop()
+    assert recovered["count"] >= 1  # recovered on the down→up edge
+
+
+@pytest.mark.asyncio
+async def test_health_stable_up_does_not_recover():
+    """A steady-healthy backend must NOT trigger repeated recovers (only the
+    down→up edge does)."""
+    import asyncio
+    mgr = _manager([_mbox("m1")])
+    object.__setattr__(mgr._config, "health_poll_seconds", 0.01)
+
+    recovered = {"count": 0}
+
+    async def fake_recover():
+        recovered["count"] += 1
+
+    for eng in mgr._engines.values():
+        eng.recover = fake_recover
+
+    async def always_up():
+        return True
+
+    mgr._pusher.health = always_up
+    await mgr.start()
+    await asyncio.sleep(0.05)
+    await mgr.stop()
+    assert recovered["count"] == 0  # boot assumes healthy; no down→up edge

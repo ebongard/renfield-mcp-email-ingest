@@ -291,3 +291,32 @@ async def test_run_processes_watch_events():
     eng = _engine(prov, push)
     await eng.run()
     assert sorted(prov.moved) == [("1", "Verarbeitet"), ("2", "Verarbeitet")]
+
+# ---- backend-recovery recover() ---------------------------------------------
+
+@pytest.mark.asyncio
+async def test_recover_unparks_exhausted_and_redispatches():
+    """A message parked in _exhausted during a backend outage is un-parked and
+    re-pushed by recover() (still UNSEEN → re-listed), no restart needed."""
+    raw = build_message(attachments=[PDF])
+    prov = FakeProvider({"1": raw}, unseen=["1"])
+    push = FakePusher(_ok())
+    eng = _engine(prov, push)
+    eng._exhausted.add("1")  # exhausted its retries during the outage
+    await eng.recover()
+    assert "1" not in eng._exhausted           # un-parked
+    assert len(push.calls) == 1                 # re-dispatched + pushed
+    assert ("1", "Verarbeitet") in prov.moved   # moved out of the inbox on success
+
+
+@pytest.mark.asyncio
+async def test_recover_noop_when_stopped():
+    """recover() must not act on a stopped engine (avoid racing teardown)."""
+    prov = FakeProvider({"1": build_message(attachments=[PDF])}, unseen=["1"])
+    push = FakePusher(_ok())
+    eng = _engine(prov, push)
+    eng._exhausted.add("1")
+    eng._stopped.set()
+    await eng.recover()
+    assert eng._exhausted == {"1"}   # untouched
+    assert push.calls == []          # nothing dispatched
