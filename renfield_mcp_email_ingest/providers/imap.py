@@ -226,6 +226,19 @@ class ImapProvider(MailboxProvider):
         self._last_error = None
         while True:
             idle = await self._idle.idle_start(timeout=self._idle_renew)
+            # Catch-up scan RIGHT AFTER (re-)arming IDLE. Mail that arrived while we
+            # were briefly NOT idling — the gap between the previous wake's
+            # ``idle_done`` and this ``idle_start`` (during which we ran SEARCH +
+            # re-armed) — delivers its ``EXISTS`` to the idle connection with no
+            # active waiter, so aioimaplib logs it as an "ignored untagged response"
+            # and drops it. The post-wake SEARCH below already ran before that mail
+            # was appended, so WITHOUT this the message sits UNSEEN until the NEXT
+            # server push or the 25-min renew — the observed "only the first of
+            # several rapid mails gets processed" bug. Searching on the dedicated
+            # ``_cmd`` connection right after arming ``_idle`` closes the gap; the
+            # UNSEEN filter + the engine's ``_inflight`` de-dup make it idempotent.
+            for uid in await self._search_unseen():
+                self._queue.put_nowait(NewMessage(uid))
             try:
                 # Returns on a server push, or raises TimeoutError on the renew
                 # window — both mean "end this IDLE and re-scan / re-arm".
